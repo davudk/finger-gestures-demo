@@ -1,0 +1,453 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Finger Gestures Demo</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: rgba(22, 25, 32, 0.85);
+    --text: #e6e8ee;
+    --muted: #8a90a0;
+    --accent: #6aa8ff;
+    --border: rgba(255, 255, 255, 0.08);
+  }
+  html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: var(--bg);
+    color: var(--text);
+    font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    /* Block swipe-back navigation and pull-to-refresh */
+    overscroll-behavior: none;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+  }
+  canvas {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+    /* Let JS handle every touch gesture instead of the browser */
+    touch-action: none;
+    cursor: grab;
+  }
+  canvas.dragging { cursor: grabbing; }
+  .hud {
+    position: fixed;
+    top: 12px;
+    left: 12px;
+    padding: 10px 12px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    min-width: 190px;
+    pointer-events: none;
+  }
+  .hud h1 { font-size: 13px; margin: 0 0 6px; font-weight: 600; }
+  .hud dl {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 2px 12px;
+    margin: 0;
+    font-variant-numeric: tabular-nums;
+  }
+  .hud dt { color: var(--muted); }
+  .hud dd { margin: 0; text-align: right; }
+  #source { color: var(--accent); }
+  .help {
+    position: fixed;
+    left: 12px;
+    right: 12px;
+    bottom: 12px;
+    max-width: 420px;
+    padding: 10px 12px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    color: var(--muted);
+    pointer-events: none;
+  }
+  .help b { color: var(--text); font-weight: 500; }
+  button {
+    position: fixed;
+    top: 12px;
+    right: 12px;
+    padding: 8px 14px;
+    font: inherit;
+    color: var(--text);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    cursor: pointer;
+  }
+  button:active { background: rgba(106, 168, 255, 0.25); }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div class="hud">
+  <h1>Finger Gestures</h1>
+  <dl>
+    <dt>Zoom</dt><dd id="zoom">100%</dd>
+    <dt>Rotation</dt><dd id="rot">0°</dd>
+    <dt>Pan</dt><dd id="pan">0, 0</dd>
+    <dt>Input</dt><dd id="source">—</dd>
+  </dl>
+</div>
+
+<button id="reset">Reset</button>
+
+<div class="help">
+  <b>Touch:</b> two fingers to pan, pinch to zoom, twist to rotate.<br>
+  <b>Trackpad:</b> two-finger scroll to pan, pinch to zoom. Rotate works in Safari,
+  or hold <b>⌥ Option</b> while scrolling in any browser.<br>
+  <b>Mouse:</b> drag to pan, ⌘/Ctrl + wheel to zoom. Press <b>0</b> to reset.
+</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  const ui = {
+    zoom: document.getElementById('zoom'),
+    rot: document.getElementById('rot'),
+    pan: document.getElementById('pan'),
+    source: document.getElementById('source'),
+  };
+
+  // View transform: screen = t + R(angle) * scale * world
+  const view = { tx: 0, ty: 0, scale: 1, angle: 0 };
+  const MIN_SCALE = 0.05, MAX_SCALE = 40;
+
+  let width = 0, height = 0, dpr = 1;
+  let dirty = false;
+
+  function resize() {
+    dpr = window.devicePixelRatio || 1;
+    width = window.innerWidth;
+    height = window.innerHeight;
+    canvas.width = Math.round(width * dpr);
+    canvas.height = Math.round(height * dpr);
+    requestDraw();
+  }
+
+  function resetView() {
+    view.tx = width / 2;
+    view.ty = height / 2;
+    view.scale = 1;
+    view.angle = 0;
+    setSource('reset');
+    requestDraw();
+  }
+
+  /**
+   * Core of every gesture: the point that was under screen point `from`
+   * moves to screen point `to`, while the view scales by `ds` and rotates
+   * by `da` radians around that point.
+   *   newScreen = to + R(da) * ds * (oldScreen - from)
+   */
+  function applyGesture(fromX, fromY, toX, toY, ds, da) {
+    const newScale = clamp(view.scale * ds, MIN_SCALE, MAX_SCALE);
+    ds = newScale / view.scale;
+    const cos = Math.cos(da) * ds, sin = Math.sin(da) * ds;
+    const dx = view.tx - fromX, dy = view.ty - fromY;
+    view.tx = toX + cos * dx - sin * dy;
+    view.ty = toY + sin * dx + cos * dy;
+    view.scale = newScale;
+    view.angle += da;
+    requestDraw();
+  }
+
+  // ---------- Touch / pen / mouse via Pointer Events ----------
+  const pointers = new Map(); // pointerId -> {x, y}
+
+  canvas.addEventListener('pointerdown', (e) => {
+    try { canvas.setPointerCapture(e.pointerId); } catch {}
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (e.pointerType === 'mouse') canvas.classList.add('dragging');
+    requestDraw();
+  });
+
+  canvas.addEventListener('pointermove', (e) => {
+    const p = pointers.get(e.pointerId);
+    if (!p) return;
+
+    if (pointers.size >= 2) {
+      // Use the first two fingers down
+      const [a, b] = [...pointers.values()];
+      const before = pair(a, b);
+      p.x = e.clientX;
+      p.y = e.clientY;
+      const after = pair(a, b);
+      if (before.dist > 0) {
+        applyGesture(before.mx, before.my, after.mx, after.my,
+                     after.dist / before.dist, angleDelta(before.angle, after.angle));
+        setSource(`touch · ${pointers.size} fingers`);
+      }
+    } else {
+      // Single pointer: plain drag-to-pan
+      const dx = e.clientX - p.x, dy = e.clientY - p.y;
+      p.x = e.clientX;
+      p.y = e.clientY;
+      applyGesture(0, 0, dx, dy, 1, 0);
+      setSource(e.pointerType === 'mouse' ? 'mouse drag' : `${e.pointerType} · 1 finger`);
+    }
+  });
+
+  function endPointer(e) {
+    pointers.delete(e.pointerId);
+    if (e.pointerType === 'mouse') canvas.classList.remove('dragging');
+    requestDraw();
+  }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+
+  function pair(a, b) {
+    return {
+      mx: (a.x + b.x) / 2,
+      my: (a.y + b.y) / 2,
+      dist: Math.hypot(b.x - a.x, b.y - a.y),
+      angle: Math.atan2(b.y - a.y, b.x - a.x),
+    };
+  }
+
+  // ---------- Trackpad / mouse wheel ----------
+  // Chrome, Firefox and Edge report a trackpad pinch as a wheel event with ctrlKey = true.
+  let safariGestureActive = false;
+
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault(); // stop page scroll and browser zoom
+    const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? height : 1;
+    const dx = e.deltaX * unit, dy = e.deltaY * unit;
+
+    if (e.ctrlKey || e.metaKey) {
+      if (safariGestureActive) return; // Safari already handles this pinch
+      const ds = Math.exp(-dy / 100);
+      applyGesture(e.clientX, e.clientY, e.clientX, e.clientY, ds, 0);
+      setSource(e.ctrlKey ? 'trackpad pinch' : 'wheel zoom');
+    } else if (e.altKey) {
+      // Rotation fallback for browsers without trackpad rotate events
+      const da = (dx + dy) * 0.005;
+      applyGesture(e.clientX, e.clientY, e.clientX, e.clientY, 1, da);
+      setSource('⌥ + scroll rotate');
+    } else {
+      applyGesture(0, 0, -dx, -dy, 1, 0);
+      setSource('trackpad scroll');
+    }
+  }, { passive: false });
+
+  // ---------- Safari GestureEvents (trackpad pinch + rotate) ----------
+  // `scale` and `rotation` are cumulative since gesturestart, so track the last values.
+  let lastGesture = null;
+
+  window.addEventListener('gesturestart', (e) => {
+    e.preventDefault();
+    // On iOS these also fire for touches; Pointer Events already handle those.
+    if (pointers.size > 0) return;
+    safariGestureActive = true;
+    lastGesture = { scale: e.scale, rotation: e.rotation };
+  }, { passive: false });
+
+  window.addEventListener('gesturechange', (e) => {
+    e.preventDefault();
+    if (!lastGesture || pointers.size > 0) return;
+    const ds = e.scale / lastGesture.scale;
+    const da = (e.rotation - lastGesture.rotation) * Math.PI / 180;
+    lastGesture = { scale: e.scale, rotation: e.rotation };
+    applyGesture(e.clientX, e.clientY, e.clientX, e.clientY, ds, da);
+    setSource('Safari gesture');
+  }, { passive: false });
+
+  window.addEventListener('gestureend', (e) => {
+    e.preventDefault();
+    safariGestureActive = false;
+    lastGesture = null;
+  }, { passive: false });
+
+  // ---------- Misc controls ----------
+  document.getElementById('reset').addEventListener('click', resetView);
+  window.addEventListener('keydown', (e) => { if (e.key === '0') resetView(); });
+  window.addEventListener('resize', resize);
+
+  // ---------- Drawing ----------
+  function requestDraw() {
+    if (!dirty) {
+      dirty = true;
+      requestAnimationFrame(draw);
+    }
+  }
+
+  function draw() {
+    dirty = false;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = '#0f1115';
+    ctx.fillRect(0, 0, width, height);
+
+    // World transform
+    const c = Math.cos(view.angle) * view.scale;
+    const s = Math.sin(view.angle) * view.scale;
+    ctx.setTransform(dpr * c, dpr * s, -dpr * s, dpr * c, dpr * view.tx, dpr * view.ty);
+
+    drawGrid(c, s);
+    drawScene();
+
+    // Screen-space overlay: active fingers
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    drawPointers();
+    updateHud();
+  }
+
+  function drawGrid(c, s) {
+    // Visible world bounds = inverse transform of screen corners
+    const det = c * c + s * s;
+    const toWorld = (x, y) => {
+      const dx = x - view.tx, dy = y - view.ty;
+      return [(c * dx + s * dy) / det, (-s * dx + c * dy) / det];
+    };
+    const corners = [toWorld(0, 0), toWorld(width, 0), toWorld(0, height), toWorld(width, height)];
+    const xs = corners.map(p => p[0]), ys = corners.map(p => p[1]);
+    const minX = Math.min(...xs), maxX = Math.max(...xs);
+    const minY = Math.min(...ys), maxY = Math.max(...ys);
+
+    // Keep grid spacing roughly 30–60 screen px at any zoom
+    const step = 50 * Math.pow(2, Math.round(-Math.log2(view.scale)));
+    const px = 1 / view.scale; // one screen pixel in world units
+
+    ctx.lineWidth = px;
+    ctx.beginPath();
+    for (let x = Math.floor(minX / step) * step; x <= maxX; x += step) {
+      ctx.moveTo(x, minY); ctx.lineTo(x, maxY);
+    }
+    for (let y = Math.floor(minY / step) * step; y <= maxY; y += step) {
+      ctx.moveTo(minX, y); ctx.lineTo(maxX, y);
+    }
+    ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+    ctx.stroke();
+
+    // Axes
+    ctx.lineWidth = 1.5 * px;
+    ctx.beginPath();
+    ctx.moveTo(minX, 0); ctx.lineTo(maxX, 0);
+    ctx.strokeStyle = 'rgba(255,107,107,0.5)';
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(0, minY); ctx.lineTo(0, maxY);
+    ctx.strokeStyle = 'rgba(106,168,255,0.5)';
+    ctx.stroke();
+  }
+
+  function drawScene() {
+    // A few shapes so pan, zoom and rotation are easy to see
+    roundRect(-220, -150, 160, 110, 16, '#6aa8ff');
+    circle(150, -90, 60, '#ff8a5b');
+    roundRect(70, 70, 180, 90, 12, '#7bd88f');
+    triangle(-150, 150, 70, '#c792ea');
+
+    // Arrow pointing "up" in world space
+    ctx.save();
+    ctx.translate(0, -260);
+    ctx.fillStyle = '#ffd866';
+    ctx.beginPath();
+    ctx.moveTo(0, -40); ctx.lineTo(28, 10); ctx.lineTo(9, 10);
+    ctx.lineTo(9, 50); ctx.lineTo(-9, 50); ctx.lineTo(-9, 10); ctx.lineTo(-28, 10);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+
+    ctx.fillStyle = '#e6e8ee';
+    ctx.font = '600 32px -apple-system, BlinkMacSystemFont, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('Pinch · Twist · Pan', 0, 0);
+
+    // Tiny text rewards zooming in
+    ctx.font = '3px -apple-system, BlinkMacSystemFont, sans-serif';
+    ctx.fillStyle = '#8a90a0';
+    ctx.fillText('you zoomed all the way in 👋', 160, 112);
+  }
+
+  function roundRect(x, y, w, h, r, color) {
+    ctx.beginPath();
+    ctx.roundRect(x, y, w, h, r);
+    ctx.fillStyle = color;
+    ctx.fill();
+  }
+  function circle(x, y, r, color) {
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fillStyle = color;
+    ctx.fill();
+  }
+  function triangle(x, y, r, color) {
+    ctx.beginPath();
+    for (let i = 0; i < 3; i++) {
+      const a = -Math.PI / 2 + i * (Math.PI * 2 / 3);
+      ctx.lineTo(x + Math.cos(a) * r, y + Math.sin(a) * r);
+    }
+    ctx.closePath();
+    ctx.fillStyle = color;
+    ctx.fill();
+  }
+
+  function drawPointers() {
+    const pts = [...pointers.values()];
+    if (pts.length >= 2) {
+      const [a, b] = pts;
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+      ctx.strokeStyle = 'rgba(106,168,255,0.6)';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([6, 6]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      const m = pair(a, b);
+      ctx.beginPath();
+      ctx.arc(m.mx, m.my, 6, 0, Math.PI * 2);
+      ctx.fillStyle = '#6aa8ff';
+      ctx.fill();
+    }
+    for (const p of pts) {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 28, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(106,168,255,0.18)';
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(106,168,255,0.8)';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+  }
+
+  function updateHud() {
+    ui.zoom.textContent = `${Math.round(view.scale * 100)}%`;
+    let deg = (view.angle * 180 / Math.PI) % 360;
+    if (deg > 180) deg -= 360;
+    if (deg <= -180) deg += 360;
+    ui.rot.textContent = `${deg.toFixed(1)}°`;
+    ui.pan.textContent = `${Math.round(view.tx - width / 2)}, ${Math.round(view.ty - height / 2)}`;
+  }
+
+  function setSource(text) { ui.source.textContent = text; }
+
+  // ---------- Helpers ----------
+  function clamp(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
+  function angleDelta(a, b) {
+    let d = b - a;
+    if (d > Math.PI) d -= 2 * Math.PI;
+    if (d < -Math.PI) d += 2 * Math.PI;
+    return d;
+  }
+
+  resize();
+  resetView();
+  setSource('—');
+})();
+</script>
+</body>
+</html>
