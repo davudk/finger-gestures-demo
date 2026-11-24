@@ -4,6 +4,8 @@ A small browser demo of multi-finger gestures on a canvas: pan with two fingers,
 
 **Live demo: https://davudk.github.io/finger-gestures-demo/**
 
+![Panning, zooming and rotating the canvas](docs/images/gestures.gif)
+
 | Input | Pan | Zoom | Rotate |
 |---|---|---|---|
 | Touchscreen | One or two fingers | Pinch | Two-finger twist |
